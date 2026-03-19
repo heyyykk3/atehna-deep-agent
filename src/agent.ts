@@ -165,9 +165,14 @@ async function main() {
   console.log(`[System] Initializing Stream with model: ${MODEL}...\n`);
 
   // Using stream for conversational, real-time feedback
+  // Set a high recursionLimit to allow the agent to run for 1000+ steps
   const stream = await agent.stream(
     { messages: [{ role: "user", content: userInput }] },
-    { subgraphs: true, configurable: { thread_id: "browser-session-1" } }
+    {
+      subgraphs: true,
+      recursionLimit: 2000,
+      configurable: { thread_id: "browser-session-1" }
+    }
   );
 
   for await (const [namespace, mode, data] of stream as any) {
