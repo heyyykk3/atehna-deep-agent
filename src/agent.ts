@@ -74,29 +74,41 @@ const visionVerifyTool = tool(
 
 // ── Subagents ─────────────────────────────────────────────────
 
-const navigatorAgent: SubAgent = {
-  name: "navigator",
+const actorAgent: SubAgent = {
+  name: "actor",
   description:
-    "Handles high-level browser navigation and page interactions using 'pinchtab' as the primary tool. Use this agent for clicking, typing, and navigating.",
-  systemPrompt: `You are an expert browser automation agent. Your job:
-1. Navigate to websites and interact with elements using 'pinchtab' binary via shell commands.
-2. If 'pinchtab' fails, fallback to 'patchright' (stealth playwright).
-3. Plan your actions carefully. Act, then use the execute tool to run the automation.
-4. Only use vision verification when explicitly necessary to save tokens.`,
+    "Executes browser navigation and page interactions (clicks, typing, scrolling). Call this agent when you need to physically interact with a webpage.",
+  systemPrompt: `You are an expert browser automation Actor. Your job:
+1. Perform the exact physical interactions requested by the orchestrator.
+2. ALWAYS use the 'pinchtab' binary via shell commands (execute tool) as your primary interaction method.
+3. Make sure to account for Windows vs Mac shell differences when formulating commands.
+4. Report back strictly on whether the command executed successfully or if an error occurred in the shell. Do NOT verify the visual state of the page.`,
+  model: MODEL,
+};
+
+const verifierAgent: SubAgent = {
+  name: "verifier",
+  description:
+    "Verifies whether an action performed by the Actor was successful on the webpage. Call this agent to check the current state of the page (e.g. did the page load, is the modal open, did the login succeed).",
+  systemPrompt: `You are an expert browser automation Verifier. Your job:
+1. Verify the current state of the webpage against the expected outcome.
+2. Attempt lightweight DOM or text-based verification first (via shell commands if available).
+3. If structural verification is insufficient, use the 'vision_verify' tool (which uses 'patchright') for hard visual confirmation. Use vision sparingly ("hardly needed") to save tokens.
+4. Return a clear true/false and a brief explanation of the page's state.`,
   model: MODEL,
   tools: [visionVerifyTool],
 };
 
-const visionVerifierAgent: SubAgent = {
-  name: "vision_verifier",
+const extractorAgent: SubAgent = {
+  name: "extractor",
   description:
-    "Specialized agent for deep visual analysis. Call this when you need to understand the visual layout of a page or verify a complex interaction succeeded, but sparingly.",
-  systemPrompt: `You are a visual analysis agent. Your job:
-1. Take screenshots using 'patchright'.
-2. Analyze the visual layout, check if elements are present, and verify successful state changes.
-3. Provide a concise, highly accurate description of what you see.`,
+    "Extracts structured data, scrapes tables, or reads long content from a successfully loaded webpage. Call this agent when you need to pull information off a page.",
+  systemPrompt: `You are an expert browser automation Extractor. Your job:
+1. Read and extract the specific data requested by the orchestrator from the current webpage.
+2. Use DOM querying shell tools (like curl, grep, or pinchtab extraction features) to isolate the data.
+3. Format the extracted data cleanly (JSON, Markdown, or raw text as requested) and return it.
+4. Do not perform navigation or state-changing actions. Focus purely on reading the data.`,
   model: MODEL,
-  tools: [visionVerifyTool],
 };
 
 
@@ -109,24 +121,25 @@ const backend = new LocalShellBackend({
   maxOutputBytes: 100_000,
 });
 
-// ── Agent ─────────────────────────────────────────────────────
+// ── Main Orchestrator Agent ───────────────────────────────────
 
 const agent = createDeepAgent({
   model: MODEL,
 
-  systemPrompt: `You are a specialized Browser Automation Agent.
-Your architecture is built around navigating, acting, and verifying websites with high precision (Claude-level best practices).
+  systemPrompt: `You are the Main Orchestrator for a specialized Browser Automation framework.
+Your architecture is built around the "Plan -> Act -> Verify -> Extract" loop with high precision (Claude-level best practices).
 
 Guidelines:
-- **Plan:** Break complex tasks into steps using write_todos.
-- **Act:** Use 'pinchtab' binary via shell commands (execute) as your primary tool for all interactions. Make sure to account for Windows vs Mac shell differences. Fallback to 'patchright' if 'pinchtab' is unavailable or fails.
-- **Verify:** Verify your actions succeeded. Use text-based or DOM-based verification primarily.
-- **Vision:** Use the vision verifier sparingly ("hardly needed") to save tokens, only when visual confirmation is strictly required.
-- **Subagents:** Delegate specialized navigation or heavy visual analysis to your subagents via the task tool.
-- Be precise and stick to your plan.`,
+- **Plan:** ALWAYS break complex tasks into steps using the built-in 'write_todos' tool. Update your plan as you progress.
+- **Orchestrate:** You are the manager. Do not execute browser actions yourself. Delegate tasks to your specialized subagents:
+  1. Call 'actor' to navigate, click, or type.
+  2. Call 'verifier' to check if the actor's action succeeded (especially for complex multi-step forms).
+  3. Call 'extractor' to scrape or read data from the page once it is in the correct state.
+- **Vision:** Visual verification is expensive. Instruct the verifier to use vision ONLY when strict confirmation is required ("hardly needed").
+- Be precise, monitor the progress of your plan, and summarize the final result for the user.`,
 
-  tools: [dateTimeTool, visionVerifyTool],
-  subagents: [navigatorAgent, visionVerifierAgent],
+  tools: [dateTimeTool],
+  subagents: [actorAgent, verifierAgent, extractorAgent],
   backend,
 
   // Architecture updates for long-term memory and HITL
