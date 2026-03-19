@@ -5,3 +5,10 @@ dist/
 *.d.ts
 *.map
 !src/**
+
+# Runtime workspace (user uploads, downloads, screenshots)
+agent-workspace/*
+!agent-workspace/.gitkeep
+!agent-workspace/*/.gitkeep
+agent-runtime/
+agent-memory/

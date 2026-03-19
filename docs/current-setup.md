@@ -51,7 +51,7 @@ Deep-Agent/
 | Store (cross-thread)     | Missing   | No `store` configured         | No persistence across conversations   |
 | Checkpointer             | Missing   | No `checkpointer` configured  | No state persistence between runs     |
 | Skills                   | Missing   | No `skills` paths configured  | No progressive knowledge loading      |
-| Custom middleware         | Missing   | No `middleware` configured     | No hooks into tool call pipeline      |
+| Custom middleware         | Missing   | No `middleware` configured     | No custom middleware (retry, fallback, PII, limits, etc. — must be built, not in SDK) |
 | Structured output        | Missing   | No `responseFormat` configured | No typed/validated responses          |
 | Multi-provider models    | Missing   | All subagents use same model   | No best-fit-per-task optimization     |
 | Prompt caching           | N/A       | Anthropic-only feature         | Not applicable with Gemini            |
