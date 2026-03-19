@@ -8,6 +8,7 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { MemorySaver } from "@langchain/langgraph-checkpoint";
 import { InMemoryStore } from "@langchain/langgraph";
+import { chromium } from "patchright";
 
 // ── Configuration ─────────────────────────────────────────────
 
@@ -29,16 +30,44 @@ const dateTimeTool = tool(
 // Fallback vision verification tool using patchright (stealth playwright)
 const visionVerifyTool = tool(
   async ({ url }: { url: string }) => {
-    // This is a placeholder for actual patchright implementation
-    // In a real implementation, it would use patchright to take a screenshot and pass it to the model.
-    // For this example, we mock a response since we don't have patchright installed fully in the system context.
-    return `[Mock] Vision Verification: Captured screenshot of ${url} and analyzed it. Page looks rendered correctly.`;
+    console.log(`\n[System] Launching patchright for vision verification on: ${url}...`);
+    let browser;
+    try {
+      // Launch patched chromium
+      browser = await chromium.launch({ headless: true });
+      const page = await browser.newPage();
+      await page.goto(url, { waitUntil: "networkidle" });
+
+      // Capture screenshot as base64
+      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 80 });
+      const base64Image = screenshotBuffer.toString("base64");
+
+      return [
+        {
+          type: "text",
+          text: `[Vision System] Successfully navigated to ${url} and captured a screenshot. Analyze this image visually to verify the layout or action success.`,
+        },
+        {
+          type: "image_url",
+          image_url: { url: `data:image/jpeg;base64,${base64Image}` },
+        },
+      ];
+    } catch (error: any) {
+      return [
+        {
+          type: "text",
+          text: `[Vision System Error] Failed to capture screenshot using patchright: ${error.message}`,
+        },
+      ];
+    } finally {
+      if (browser) await browser.close();
+    }
   },
   {
     name: "vision_verify",
-    description: "Takes a screenshot of the current page using patchright and analyzes it visually. Use ONLY when strictly necessary ('hardly needed') to save tokens.",
+    description: "Takes a screenshot of the current page using patchright and returns the base64 image data for you to analyze visually. Use ONLY when strictly necessary ('hardly needed') to save tokens.",
     schema: z.object({
-      url: z.string().describe("The URL or identifier of the page to verify"),
+      url: z.string().describe("The URL to navigate to and verify"),
     }),
   }
 );
@@ -90,7 +119,7 @@ Your architecture is built around navigating, acting, and verifying websites wit
 
 Guidelines:
 - **Plan:** Break complex tasks into steps using write_todos.
-- **Act:** Use 'pinchtab' binary via shell commands (execute) as your primary tool for all interactions. Fallback to 'patchright' if 'pinchtab' is unavailable or fails.
+- **Act:** Use 'pinchtab' binary via shell commands (execute) as your primary tool for all interactions. Make sure to account for Windows vs Mac shell differences. Fallback to 'patchright' if 'pinchtab' is unavailable or fails.
 - **Verify:** Verify your actions succeeded. Use text-based or DOM-based verification primarily.
 - **Vision:** Use the vision verifier sparingly ("hardly needed") to save tokens, only when visual confirmation is strictly required.
 - **Subagents:** Delegate specialized navigation or heavy visual analysis to your subagents via the task tool.
