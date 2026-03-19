@@ -164,6 +164,39 @@ You are ONLY called when the main browser agent is blocked by bot protection.
 - Don't navigate too fast — add browserWait between pages
 - Avoid patterns that trigger bot detection (rapid clicks, etc.)`;
 
+const EXTRACTOR_RESPONSE_SCHEMA = z.object({
+  status: z.enum(["success", "partial", "failed"]),
+  data: z.unknown().describe("The extracted data in the requested format"),
+  format: z
+    .enum(["json", "markdown", "text", "csv"])
+    .describe("Format of the extracted data"),
+  summary: z.string().describe("Brief description of what was extracted"),
+  files: z
+    .array(z.string())
+    .default([])
+    .describe("Any /workspace/... files created"),
+});
+
+const EXTRACTOR_PROMPT = `You are Atehna's data extraction agent.
+
+You extract structured data from web pages that the browser-agent has already loaded.
+You do NOT navigate or interact — you only READ and EXTRACT.
+
+## Rules
+1. Use browserSnapshot or browserText to read page content
+2. Parse and structure the data in the requested format (JSON, markdown, table, CSV)
+3. For tables, extract all rows and columns — don't truncate
+4. For long pages, use chunked reading: snapshot → scroll → snapshot → repeat
+5. Save extracted data to /workspace/research/ or /workspace/downloads/
+6. If the data is incomplete (pagination, lazy loading), note it in your response
+7. Never click, fill, or navigate — that's the browser-agent's job
+
+## Extraction Tactics
+- Use browserText for bulk text content (articles, documentation)
+- Use browserSnapshot for structured data (tables, forms, lists)
+- Use browserEval for data in JavaScript variables or APIs
+- For paginated data, report what's visible and recommend browser-agent scroll/paginate`;
+
 const RESEARCHER_PROMPT = `You are Atehna's research agent.
 
 Search the web and gather information that isn't available on the current browser page.
@@ -223,10 +256,37 @@ export function createSubagents(deps: SubagentDeps): SubAgent[] {
     ),
   };
 
+  // ── extractor ─────────────────────────────────────────────
+  // Read-only browser tools for data extraction (no click/fill/type)
+  const extractorBrowserTools = [
+    browserTools[1],  // browserSnapshot
+    browserTools[11], // browserScroll
+    browserTools[14], // browserText
+    browserTools[16], // browserEval
+    browserTools[17], // browserWait
+    browserTools[18], // browserFind
+    browserTools[20], // browserTabs
+  ] as StructuredTool[];
+
+  const extractor: SubAgent = {
+    name: "extractor",
+    description:
+      "Extracts structured data, scrapes tables, or reads content from a loaded webpage. " +
+      "Use when you need to pull data from a page that browser-agent has already navigated to. " +
+      "Does NOT navigate or interact — only reads and extracts.",
+    systemPrompt: EXTRACTOR_PROMPT,
+    tools: extractorBrowserTools,
+    skills: ["/skills/web-scraping/"],
+    responseFormat: getStructuredOutputStrategy(
+      deps.provider,
+      EXTRACTOR_RESPONSE_SCHEMA,
+    ),
+  };
+
   // ── researcher ───────────────────────────────────────────
   const researcherBrowserTools = [
-    browserTools[0], // browserNavigate
-    browserTools[1], // browserSnapshot
+    browserTools[0],  // browserNavigate
+    browserTools[1],  // browserSnapshot
     browserTools[14], // browserText
     browserTools[17], // browserWait
   ] as StructuredTool[];
@@ -242,5 +302,5 @@ export function createSubagents(deps: SubagentDeps): SubAgent[] {
     skills: ["/skills/web-scraping/"],
   };
 
-  return [browserAgent, stealthAgent, researcher];
+  return [browserAgent, stealthAgent, extractor, researcher];
 }

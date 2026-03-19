@@ -1,224 +1,307 @@
-import "dotenv/config";
 import {
   createDeepAgent,
-  LocalShellBackend,
-  type SubAgent,
+  CompositeBackend,
+  FilesystemBackend,
 } from "deepagents";
-import { tool } from "@langchain/core/tools";
+import { modelRetryMiddleware } from "langchain";
+import { MemorySaver } from "@langchain/langgraph";
 import { z } from "zod";
-import { MemorySaver } from "@langchain/langgraph-checkpoint";
-import { InMemoryStore } from "@langchain/langgraph";
-import { chromium } from "patchright";
 
-// ── Configuration ─────────────────────────────────────────────
+import { PROVIDERS, TRUST_LEVELS, type AtehnaConfig } from "./types.js";
+import { getModel, getStructuredOutputStrategy } from "./config/providers.js";
+import { buildInterruptOn } from "./config/hitl.js";
+import { createSubagents, type SubagentDeps } from "./config/subagents.js";
+import { browserRouterMiddleware } from "./services/browser-router.js";
+import { ensureRuntimeFiles } from "./services/runtime-files.js";
+import { dateTimeTool } from "./tools/datetime.js";
+import { askUserTool } from "./tools/ask-user.js";
+import { thinkTool } from "./tools/think.js";
+import { progressTool } from "./tools/progress.js";
+import { visionVerifyTool } from "./tools/vision-verify.js";
 
-// We use the same model across all agents for consistency and state management during a single run.
-// It can be overridden by environment variable for multi-provider support.
-const MODEL = process.env.MODEL || "anthropic:claude-3-5-sonnet-latest";
+// ── System Prompt (the brain) ────────────────────────────────
 
-// ── Custom Tools ──────────────────────────────────────────────
-
-const dateTimeTool = tool(
-  async () => new Date().toISOString(),
-  {
-    name: "get_datetime",
-    description: "Returns the current date and time in ISO format",
-    schema: z.object({}),
-  }
-);
-
-// Fallback vision verification tool using patchright (stealth playwright)
-const visionVerifyTool = tool(
-  async ({ url }: { url: string }) => {
-    console.log(`\n[System] Launching patchright for vision verification on: ${url}...`);
-    let browser;
-    try {
-      // Launch patched chromium
-      browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage();
-      await page.goto(url, { waitUntil: "networkidle" });
-
-      // Capture screenshot as base64
-      const screenshotBuffer = await page.screenshot({ type: "jpeg", quality: 80 });
-      const base64Image = screenshotBuffer.toString("base64");
-
-      return [
-        {
-          type: "text",
-          text: `[Vision System] Successfully navigated to ${url} and captured a screenshot. Analyze this image visually to verify the layout or action success.`,
-        },
-        {
-          type: "image_url",
-          image_url: { url: `data:image/jpeg;base64,${base64Image}` },
-        },
-      ];
-    } catch (error: any) {
-      return [
-        {
-          type: "text",
-          text: `[Vision System Error] Failed to capture screenshot using patchright: ${error.message}`,
-        },
-      ];
-    } finally {
-      if (browser) await browser.close();
-    }
-  },
-  {
-    name: "vision_verify",
-    description: "Takes a screenshot of the current page using patchright and returns the base64 image data for you to analyze visually. Use ONLY when strictly necessary ('hardly needed') to save tokens.",
-    schema: z.object({
-      url: z.string().describe("The URL to navigate to and verify"),
-    }),
-  }
-);
-
-// ── Subagents ─────────────────────────────────────────────────
-
-const actorAgent: SubAgent = {
-  name: "actor",
-  description:
-    "Executes browser navigation and page interactions (clicks, typing, scrolling). Call this agent when you need to physically interact with a webpage.",
-  systemPrompt: `You are an expert browser automation Actor. Your job:
-1. Perform the exact physical interactions requested by the orchestrator.
-2. ALWAYS use the 'pinchtab' binary via shell commands (execute tool) as your primary interaction method.
-3. Make sure to account for Windows vs Mac shell differences when formulating commands.
-4. Report back strictly on whether the command executed successfully or if an error occurred in the shell. Do NOT verify the visual state of the page.`,
-  model: MODEL,
-};
-
-const verifierAgent: SubAgent = {
-  name: "verifier",
-  description:
-    "Verifies whether an action performed by the Actor was successful on the webpage. Call this agent to check the current state of the page (e.g. did the page load, is the modal open, did the login succeed).",
-  systemPrompt: `You are an expert browser automation Verifier. Your job:
-1. Verify the current state of the webpage against the expected outcome.
-2. Attempt lightweight DOM or text-based verification first (via shell commands if available).
-3. If structural verification is insufficient, use the 'vision_verify' tool (which uses 'patchright') for hard visual confirmation. Use vision sparingly ("hardly needed") to save tokens.
-4. Return a clear true/false and a brief explanation of the page's state.`,
-  model: MODEL,
-  tools: [visionVerifyTool],
-};
-
-const extractorAgent: SubAgent = {
-  name: "extractor",
-  description:
-    "Extracts structured data, scrapes tables, or reads long content from a successfully loaded webpage. Call this agent when you need to pull information off a page.",
-  systemPrompt: `You are an expert browser automation Extractor. Your job:
-1. Read and extract the specific data requested by the orchestrator from the current webpage.
-2. Use DOM querying shell tools (like curl, grep, or pinchtab extraction features) to isolate the data.
-3. Format the extracted data cleanly (JSON, Markdown, or raw text as requested) and return it.
-4. Do not perform navigation or state-changing actions. Focus purely on reading the data.`,
-  model: MODEL,
-};
-
-
-// ── Backend ───────────────────────────────────────────────────
-
-const backend = new LocalShellBackend({
-  rootDir: process.cwd(),
-  inheritEnv: true,
-  timeout: 120,
-  maxOutputBytes: 100_000,
+const AtehnaContextSchema = z.object({
+  interfaceMode: z.enum(["repl", "http", "api"]),
+  trustLevel: z.enum(TRUST_LEVELS),
+  provider: z.enum(PROVIDERS),
+  model: z.string(),
+  threadId: z.string(),
 });
 
-// ── Main Orchestrator Agent ───────────────────────────────────
-
-export const agent = createDeepAgent({
-  model: MODEL,
-
-  systemPrompt: `You are the Main Orchestrator for a specialized Browser Automation framework.
-Your architecture is built around continuous, autonomous "Think -> Act -> Observe" loops with high precision (Claude-level best practices).
-
-Guidelines:
-- **Think Before You Act:** DO NOT generate a massive rigid 50-step plan upfront. Evaluate the CURRENT state, decide the immediately necessary next 1-3 steps, execute them, observe the results, and repeat.
-- **Orchestrate:** You are the manager. Do not execute browser actions yourself. Delegate tasks to your specialized subagents:
-  1. Call 'actor' to navigate, click, or type.
-  2. Call 'verifier' to check if the actor's action succeeded (especially for complex multi-step forms).
-  3. Call 'extractor' to scrape or read data from the page once it is in the correct state.
-- **Vision:** Visual verification is expensive. Instruct the verifier to use vision ONLY when strict confirmation is required ("hardly needed").
-- Work autonomously until the user's ultimate task is completely resolved, thinking continuously as you navigate through the task. Provide a final summary when finished.`,
-
-  tools: [dateTimeTool],
-  subagents: [actorAgent, verifierAgent, extractorAgent],
-  backend,
-
-  // Architecture updates for long-term memory and HITL
-  checkpointer: new MemorySaver(),
-  store: new InMemoryStore(),
-  memory: ["./AGENTS.md"],
-  skills: ["./skills/"],
-
-  interruptOn: {
-    execute: true,
-    write_file: {
-      allowedDecisions: ["approve", "edit"] as const,
-    },
-  },
+const AtehnaResponseSchema = z.object({
+  success: z
+    .boolean()
+    .describe("Whether the task reached the intended outcome."),
+  summary: z.string().describe("Short plain-English summary for the user."),
+  files: z
+    .array(z.string())
+    .default([])
+    .describe("Any /workspace/... files created or needed."),
+  blockers: z
+    .array(z.string())
+    .default([])
+    .describe("Remaining blockers, failures, or missing information."),
+  nextSteps: z
+    .array(z.string())
+    .default([])
+    .describe("Optional follow-up actions if the task is incomplete."),
 });
 
-// ── Electron & IPC API ────────────────────────────────────────
+// Enhanced brain prompt with three-stage thinking, progress tracking,
+// dual context strategy, and patterns from Stagehand/Browserable/OpenAI CUA
+const BRAIN_PROMPT = `You are Atehna — an intelligent browser automation agent.
+
+You CANNOT interact with the browser directly.
+You delegate ALL browser actions to your subagents.
+
+## Three-Stage Approach (THINK → ACT → VERIFY)
+
+For every task, follow this discipline:
+
+### Stage 1: THINK (before any action)
+Use the "think" tool to reason through your approach BEFORE delegating to subagents.
+Plan what you will do, anticipate problems, and decide your strategy.
+Never jump straight to browser actions on unfamiliar pages.
+
+Example:
+  think("User wants to fill a job application on LinkedIn.
+    Steps: 1) Navigate to the job URL, 2) Click Apply,
+    3) Fill each form section, 4) Upload resume, 5) Submit.
+    LinkedIn has multi-page applications — need to snapshot after each page.
+    Check /memories/site-patterns.md for LinkedIn patterns first.")
+
+### Stage 2: ACT (delegate to subagents)
+Give browser-agent a SINGLE clear task per delegation.
+Include context from your thinking and any site patterns from memory.
+
+For each browser interaction:
+1. SEE:  Ask browser-agent to snapshot the current page
+2. ACT:  Tell browser-agent to perform ONE action (click, fill, etc.)
+3. SEE:  Ask browser-agent to snapshot again to confirm
+
+### Stage 3: VERIFY (confirm and track progress)
+After each major step:
+1. Read browser-agent's structured response (status, pageSummary, verification, blockers)
+2. Call reportProgress with completion % and remaining steps
+3. Decide next action based on verified state — never assume success
+
+If verification fails:
+- Think about WHY it failed (wrong element? page changed? timing issue?)
+- Try a different approach (different element, different method, browserWait first)
+- If stuck after 3 attempts → ask_user for guidance
+
+## Dual Context Strategy
+
+For most interactions, the accessibility tree snapshot is sufficient (~800 tokens).
+For complex or visual pages, ask browser-agent to ALSO take a screenshot.
+
+Use snapshot (fast, structured) for:
+- Forms, text navigation, link clicking, data extraction
+
+Add screenshot (visual, ~1000 tokens) when:
+- Page has canvas elements, complex layouts, or image-heavy content
+- Snapshot doesn't show expected elements
+- Visual verification needed (image upload, layout changes)
+- Debugging why an action didn't work
+
+## Subagents
+
+- browser-agent: your primary hands. Use for ALL normal browser interaction.
+  It follows its own Plan→Act→Verify cycle internally.
+- extractor: use when you need to pull structured data from a page that
+  browser-agent has already loaded (tables, lists, articles, form data).
+  It does NOT navigate — only reads and extracts.
+- stealth-agent: use ONLY when browser-agent reports being blocked by
+  bot detection (Cloudflare, CAPTCHA, DataDome, etc.)
+- researcher: use when you need information NOT on the current page
+  (background research, comparisons, reviews, how-to guides)
+
+## Vision Verification
+
+You have a visionVerify tool for direct visual analysis using patchright.
+Use it when:
+- PinchTab screenshots aren't sufficient for verification
+- You need to see the page through an anti-detection browser
+- Complex visual confirmation is needed (charts, images, layouts)
+This is expensive — prefer browserSnapshot/browserScreenshot from browser-agent first.
+
+## Chunked Page Processing
+
+For long pages, don't try to process everything at once:
+1. Snapshot to see current viewport
+2. Process what's visible
+3. Scroll down, snapshot again
+4. Repeat until you've found what you need
+
+This prevents token overflow and matches how humans browse.
+
+## Memory & Learning
+
+Before delegating to a subagent, check /memories/ for relevant patterns:
+  read_file("/memories/site-patterns.md")
+  read_file("/memories/form-mappings.md")
+If the target site has known patterns, INCLUDE them in your task description
+so the subagent benefits from past experience.
+
+Example:
+  Instead of: task(browser-agent, "Log in to LinkedIn")
+  Do:         task(browser-agent, "Log in to LinkedIn.
+                NOTE: LinkedIn uses 2-step login — email page first,
+                then password on separate page. Snapshot after each.")
+
+After completing a task, save new learnings:
+- edit_file("/memories/site-patterns.md", ...) — navigation patterns discovered
+- edit_file("/memories/form-mappings.md", ...) — form field behavior
+- edit_file("/memories/failed-approaches.md", ...) — what didn't work
+- edit_file("/memories/user-corrections.md", ...) — user edits/rejections from HITL
+
+Don't save obvious things. Save things that cost time to discover.
+
+## Auto-Escalation
+
+If browser-agent reports any of these in its blockers:
+  "Cloudflare", "Access Denied", "CAPTCHA", "bot detection",
+  "DataDome", "Please verify you are human", "blocked"
+→ Immediately switch to stealth-agent for that site.
+→ Do NOT retry with browser-agent on the same site.
+
+If stealth-agent also fails → ask_user for guidance.
+
+## Error Recovery
+
+- status "blocked" → switch to stealth-agent or ask_user
+- status "retryable_failure" → think about WHY, then retry with changed approach
+- status "needs_user_input" → ask_user, never guess sensitive data
+- "element not found" → re-snapshot with fresh refs, try browserFind
+- page still loading → use browserWait, then re-snapshot
+- stuck after 3 retries on same step → ask_user
+- PinchTab connection fails → it will auto-reconnect, just retry
+
+## Files
+
+- User uploads: /workspace/uploads/
+- Screenshots: /workspace/screenshots/
+- Research data: /workspace/research/
+- Downloads: /workspace/downloads/
+- Always mention produced files in your final response
+
+## Better Browser Tactics
+
+- Use browserFind when a page has many similar refs and you need the best match
+- Use browserWait after navigation, uploads, and submits
+- Use browserUpload for normal file inputs before browserEval
+- For complex widgets (date pickers, rich text editors) → use browserEval as last resort
+
+## Planning with Todos
+
+Use write_todos to plan before starting. The schema is:
+  write_todos({ todos: [{ content: "step description", status: "pending" }] })
+Fields: content (string, required), status ("pending" | "in_progress" | "completed").
+Do NOT use "description" or "priority" — only "content" and "status".
+
+## Rules
+
+- ALWAYS think before acting on unfamiliar pages
+- ALWAYS plan with write_todos before starting
+- ALWAYS verify after acting — never assume success
+- ALWAYS report progress after each major step
+- ALWAYS check /memories/ before working on a known site
+- ALWAYS save learnings after task completion
+- Give browser-agent ONE clear task at a time, not a long list
+- Keep your messages to the user concise
+
+## Final Output
+
+Your final answer must match the structured response schema.
+- summary: concise user-facing result
+- files: only real /workspace/... paths
+- blockers: what prevented completion, if any
+- nextSteps: only include if the task is incomplete`;
+
+// ── Agent Factory ────────────────────────────────────────────
+
+export interface CreateAtehnaAgentOptions {
+  config: AtehnaConfig;
+  subagentDeps: Omit<SubagentDeps, "provider">;
+}
 
 /**
- * An Electron-ready wrapper for the Browser Automation Agent.
- * Instantiate this in your Electron Main Process (e.g., IPC handler) to maintain
- * persistent state across messages and stream token/event data to the React UI.
+ * Create the Atehna deep agent with full configuration.
+ *
+ * Sets up:
+ * - CompositeBackend with /memories/ and /workspace/ mounts
+ * - MemorySaver checkpointer (HITL resume, state persistence)
+ * - 3 subagents (browser-agent, stealth-agent, researcher)
+ * - Summarization middleware (compresses old messages to prevent token overflow)
+ * - Model retry middleware (auto-retry on transient failures)
+ * - Model fallback middleware (try cheaper model, fall back to primary)
+ * - Browser router middleware (auto-escalation from normal to stealth)
+ * - HITL based on trust level
+ * - Think + Progress tools for structured reasoning
  */
-export class BrowserAgentSession {
-  private threadId: string;
+export async function createAtehnaAgent({
+  config,
+  subagentDeps,
+}: CreateAtehnaAgentOptions) {
+  const model = getModel(config);
+  const checkpointer = new MemorySaver();
+  const paths = await ensureRuntimeFiles();
 
-  constructor(threadId: string = "default-browser-session") {
-    this.threadId = threadId;
-  }
-
-  /**
-   * Sends a user message to the agent and yields a real-time stream of events.
-   * This generator can be consumed by an Electron IPC handler and piped via webContents.send().
-   */
-  async *chatStream(userInput: string) {
-    const stream = await agent.stream(
-      { messages: [{ role: "user", content: userInput }] },
+  const backendFactory = () => {
+    return new CompositeBackend(
+      new FilesystemBackend({
+        rootDir: paths.runtimeRoot,
+      }),
       {
-        subgraphs: true,
-        recursionLimit: 2000, // Allows continuous thought/action loops over massive tasks
-        configurable: { thread_id: this.threadId }
-      }
+        "/memories/": new FilesystemBackend({
+          rootDir: paths.memoryRoot,
+        }),
+        "/workspace/": new FilesystemBackend({
+          rootDir: paths.workspaceRoot,
+        }),
+      },
     );
+  };
 
-    for await (const chunk of stream as any) {
-      const [namespace, mode, data] = chunk;
+  const subagents = createSubagents({
+    ...subagentDeps,
+    provider: config.provider,
+  });
 
-      if (mode === "messages" && data[0]?.content) {
-        // Yield tokens dynamically back to the UI
-        if (typeof data[0].content === "string") {
-           yield { type: "token", text: data[0].content, namespace };
-        } else if (Array.isArray(data[0].content)) {
-           // Handle structured tool calls or blocks if necessary
-           yield { type: "multimodal", blocks: data[0].content, namespace };
-        }
-      } else if (mode === "updates") {
-        // Yield background tool usage or subagent completion events to the UI
-        yield { type: "update", data, namespace };
-      }
-    }
-  }
+  // Build middleware stack
+  // Note: deepagents SDK includes built-in summarization middleware
+  // for message compression in long-running sessions
+  const middleware = [
+    // Retry transient LLM failures (rate limits, network blips)
+    modelRetryMiddleware({
+      maxRetries: 2,
+    }),
+
+    // Browser router: detects bot protection patterns,
+    // logs which agent makes browser calls
+    browserRouterMiddleware,
+  ];
+
+  return createDeepAgent({
+    name: "atehna",
+    model,
+    systemPrompt: BRAIN_PROMPT,
+    tools: [dateTimeTool, askUserTool, thinkTool, progressTool, visionVerifyTool],
+    subagents,
+    middleware,
+    backend: backendFactory,
+    checkpointer,
+    interruptOn: buildInterruptOn(config.trustLevel),
+    memory: ["/AGENTS.md"],
+    skills: ["/skills/"],
+    contextSchema: AtehnaContextSchema,
+    responseFormat: getStructuredOutputStrategy(
+      config.provider,
+      AtehnaResponseSchema,
+    ),
+  });
 }
 
-// ── CLI Runner (Optional for debugging) ───────────────────────
-
-if (require.main === module) {
-  (async () => {
-    const userInput = process.argv.slice(2).join(" ") || "Navigate to a test site and summarize its contents.";
-    console.log(`\n> User: ${userInput}\n`);
-    console.log(`[System] Initializing Stream with model: ${MODEL}...\n`);
-
-    const session = new BrowserAgentSession();
-
-    // Consume the generator for terminal output
-    for await (const event of session.chatStream(userInput)) {
-      if (event.type === "token") {
-        process.stdout.write(event.text);
-      }
-    }
-    console.log("\n\n[System] Run complete.");
-  })().catch(console.error);
-}
+/** Type of the created agent for use in API layer */
+export type AtehnaAgent = Awaited<ReturnType<typeof createAtehnaAgent>>;

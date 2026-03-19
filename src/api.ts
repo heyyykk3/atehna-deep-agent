@@ -104,6 +104,7 @@ export class AgentAPI extends EventEmitter<AgentAPIEvents> {
       {
         configurable: { thread_id: tid },
         context: this.buildContext(interfaceMode, tid),
+        recursionLimit: 2000,
       },
     );
     return this.toTaskResult(result);
@@ -128,6 +129,7 @@ export class AgentAPI extends EventEmitter<AgentAPIEvents> {
         context: this.buildContext(interfaceMode, tid),
         streamMode: "messages",
         subgraphs: true,
+        recursionLimit: 2000,
       },
     );
 
