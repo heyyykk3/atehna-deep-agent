@@ -123,20 +123,20 @@ const backend = new LocalShellBackend({
 
 // ── Main Orchestrator Agent ───────────────────────────────────
 
-const agent = createDeepAgent({
+export const agent = createDeepAgent({
   model: MODEL,
 
   systemPrompt: `You are the Main Orchestrator for a specialized Browser Automation framework.
-Your architecture is built around the "Plan -> Act -> Verify -> Extract" loop with high precision (Claude-level best practices).
+Your architecture is built around continuous, autonomous "Think -> Act -> Observe" loops with high precision (Claude-level best practices).
 
 Guidelines:
-- **Plan:** ALWAYS break complex tasks into steps using the built-in 'write_todos' tool. Update your plan as you progress.
+- **Think Before You Act:** DO NOT generate a massive rigid 50-step plan upfront. Evaluate the CURRENT state, decide the immediately necessary next 1-3 steps, execute them, observe the results, and repeat.
 - **Orchestrate:** You are the manager. Do not execute browser actions yourself. Delegate tasks to your specialized subagents:
   1. Call 'actor' to navigate, click, or type.
   2. Call 'verifier' to check if the actor's action succeeded (especially for complex multi-step forms).
   3. Call 'extractor' to scrape or read data from the page once it is in the correct state.
 - **Vision:** Visual verification is expensive. Instruct the verifier to use vision ONLY when strict confirmation is required ("hardly needed").
-- Be precise, monitor the progress of your plan, and summarize the final result for the user.`,
+- Work autonomously until the user's ultimate task is completely resolved, thinking continuously as you navigate through the task. Provide a final summary when finished.`,
 
   tools: [dateTimeTool],
   subagents: [actorAgent, verifierAgent, extractorAgent],
@@ -156,37 +156,69 @@ Guidelines:
   },
 });
 
-// ── Run ───────────────────────────────────────────────────────
+// ── Electron & IPC API ────────────────────────────────────────
 
-async function main() {
-  const userInput = process.argv.slice(2).join(" ") || "Navigate to a test site and summarize its contents.";
+/**
+ * An Electron-ready wrapper for the Browser Automation Agent.
+ * Instantiate this in your Electron Main Process (e.g., IPC handler) to maintain
+ * persistent state across messages and stream token/event data to the React UI.
+ */
+export class BrowserAgentSession {
+  private threadId: string;
 
-  console.log(`\n> User: ${userInput}\n`);
-  console.log(`[System] Initializing Stream with model: ${MODEL}...\n`);
-
-  // Using stream for conversational, real-time feedback
-  // Set a high recursionLimit to allow the agent to run for 1000+ steps
-  const stream = await agent.stream(
-    { messages: [{ role: "user", content: userInput }] },
-    {
-      subgraphs: true,
-      recursionLimit: 2000,
-      configurable: { thread_id: "browser-session-1" }
-    }
-  );
-
-  for await (const [namespace, mode, data] of stream as any) {
-    if (mode === "messages" && data[0]?.content) {
-      // Simple stream output formatting
-      if (typeof data[0].content === "string") {
-        process.stdout.write(data[0].content);
-      }
-    } else if (mode === "updates") {
-       // Optionally handle updates or subagent completions
-    }
+  constructor(threadId: string = "default-browser-session") {
+    this.threadId = threadId;
   }
 
-  console.log("\n\n[System] Run complete.");
+  /**
+   * Sends a user message to the agent and yields a real-time stream of events.
+   * This generator can be consumed by an Electron IPC handler and piped via webContents.send().
+   */
+  async *chatStream(userInput: string) {
+    const stream = await agent.stream(
+      { messages: [{ role: "user", content: userInput }] },
+      {
+        subgraphs: true,
+        recursionLimit: 2000, // Allows continuous thought/action loops over massive tasks
+        configurable: { thread_id: this.threadId }
+      }
+    );
+
+    for await (const chunk of stream as any) {
+      const [namespace, mode, data] = chunk;
+
+      if (mode === "messages" && data[0]?.content) {
+        // Yield tokens dynamically back to the UI
+        if (typeof data[0].content === "string") {
+           yield { type: "token", text: data[0].content, namespace };
+        } else if (Array.isArray(data[0].content)) {
+           // Handle structured tool calls or blocks if necessary
+           yield { type: "multimodal", blocks: data[0].content, namespace };
+        }
+      } else if (mode === "updates") {
+        // Yield background tool usage or subagent completion events to the UI
+        yield { type: "update", data, namespace };
+      }
+    }
+  }
 }
 
-main().catch(console.error);
+// ── CLI Runner (Optional for debugging) ───────────────────────
+
+if (require.main === module) {
+  (async () => {
+    const userInput = process.argv.slice(2).join(" ") || "Navigate to a test site and summarize its contents.";
+    console.log(`\n> User: ${userInput}\n`);
+    console.log(`[System] Initializing Stream with model: ${MODEL}...\n`);
+
+    const session = new BrowserAgentSession();
+
+    // Consume the generator for terminal output
+    for await (const event of session.chatStream(userInput)) {
+      if (event.type === "token") {
+        process.stdout.write(event.text);
+      }
+    }
+    console.log("\n\n[System] Run complete.");
+  })().catch(console.error);
+}
